@@ -56,6 +56,8 @@ from jarvis.db.jsonutils import dumpjson
 
 from jarvis.db.jsonutils import loadjson
 from alignn.graphs import Graph, StructureDataset
+from jarvis.db.figshare import data
+import pathlib
 
 #%%
 
@@ -128,31 +130,19 @@ def get_loader(
                  ):
 
     dataset = df 
+    '''
+    if 1d array, then dataset contains only `X` (used in the predict method), 
+    in this case, add an additional target column for compatibility
+    '''
     if isinstance(dataset, pd.Series):
         dataset = dataset.to_frame()
         dataset[config.target] = -9999 # place holder for the predict method
-    elif isinstance(dataset, pd.Series):
+    elif isinstance(dataset, pd.DataFrame):
         if dataset.shape[1] == 1:
             dataset[config.target] = -9999 # place holder for the predict method
-    
+    ''' Add a column for id_tag '''
     dataset[config.id_tag] = dataset.index.tolist()
-    # # dict of dicts
-    # dataset = dataset.to_dict('index')
-    # # list of dicts
-    # dataset = list(dataset.values())
-    
-    # torch_dataset = get_torch_dataset(
-    #     dataset=dataset,
-    #     atom_features=config.atom_features,
-    #     target=config.target,
-    #     neighbor_strategy=config.neighbor_strategy,
-    #     use_canonize=config.use_canonize,
-    #     line_graph=True,
-    #     cutoff=config.cutoff,
-    #     id_tag=config.id_tag,
-    #     max_neighbors=config.max_neighbors,
-    #     classification=config.classification_threshold is not None,
-    # )
+
     
     if precomputed_graphs is not None: 
         graphs = precomputed_graphs
@@ -508,20 +498,22 @@ class AlignnLayerNorm(alignn.models.alignn_layernorm.ALIGNN):
 if __name__ == "__main__":
     
     ''' An example usage of training a model on (10% of) the Jarvis dataset '''
-    
-    from jarvis.db.figshare import data
-    d = data('dft_3d') #choose a name of dataset from above
-    df = pd.DataFrame(d).drop_duplicates('jid').set_index('jid')
-    df = df.sample(frac=1,random_state=0)
-    
     config_filename = 'config.json'
     config = loadjson(config_filename)
     config = TrainingConfig(**config)
     config.target = 'formation_energy_peratom'
-    
-    precomputed_graphs = get_graphs(df, config)
-    df['precomputed_graphs'] = precomputed_graphs
-    df.to_pickle('jarvis.pkl')
+
+    pkl_file = 'jarvis.pkl'
+    if pathlib.Path.exists(pkl_file):
+        df = pd.read_pickle(pkl_file)
+        precomputed_graphs = df['precomputed_graphs']
+    else:
+        d = data('dft_3d') #choose a name of dataset from above
+        df = pd.DataFrame(d).drop_duplicates('jid').set_index('jid')
+        df = df.sample(frac=1,random_state=0)
+        precomputed_graphs = get_graphs(df, config)
+        df['precomputed_graphs'] = precomputed_graphs
+        df.to_pickle()
 
     model = AlignnLayerNorm(config)
     
