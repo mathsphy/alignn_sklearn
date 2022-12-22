@@ -55,7 +55,7 @@ from jarvis.db.jsonutils import dumpjson
 # from ignite.contrib.handlers import TensorboardLogger,global_step_from_engine
 
 from jarvis.db.jsonutils import loadjson
-from alignn.graphs import Graph, StructureDataset
+from alignn.graphs import Graph, StructureDataset,compute_bond_cosines
 from jarvis.db.figshare import data
 import pathlib
 import dgl 
@@ -179,10 +179,28 @@ def get_loader(
             classification=config.classification_threshold is not None,
         )
         
-    elif (isinstance(var,tuple) and list(map(type, var)) == [dgl.DGLGraph, dgl.DGLGraph]):
+    elif isinstance(var,dgl.DGLGraph):
+        ''' crystal graph ''' 
+        graphs = X 
+        line_graphs = X.apply(
+            lambda g: g.line_graph(shared=True).apply_edges(compute_bond_cosines)
+            )
+        
         torch_dataset = GraphsToDataset(
-            graphs = X.apply(lambda x: x[0]), 
-            line_graphs = X.apply(lambda x: x[1]),
+            graphs = graphs,
+            line_graphs = line_graphs,
+            ids = dataset[config.id_tag],
+            labels = dataset[config.target],
+            classification=config.classification_threshold is not None,
+            )
+        
+    elif (isinstance(var,tuple) and list(map(type, var)) == [dgl.DGLGraph, dgl.DGLGraph]):
+        graphs = X.apply(lambda x: x[0])
+        line_graphs = X.apply(lambda x: x[1])
+        
+        torch_dataset = GraphsToDataset(
+            graphs = graphs,
+            line_graphs = line_graphs,
             ids = dataset[config.id_tag],
             labels = dataset[config.target],
             classification=config.classification_threshold is not None,
@@ -529,13 +547,13 @@ if __name__ == "__main__":
     config.target = 'formation_energy_peratom'
 
     pkl_file = 'jarvis.pkl'
-    if pathlib.Path.exists(pkl_file):
+    try:
         df = pd.read_pickle(pkl_file)
-    else:
+    except:
         d = data('dft_3d') #choose a name of dataset from above
         df = pd.DataFrame(d).drop_duplicates('jid').set_index('jid')
         df = df.sample(frac=0.1,random_state=0)
-        df['precomputed_graphs'] = get_graphs(df, config)
+        df['precomputed_graphs'] = get_graphs(df, config,compute_line_graph=True)
         df.to_pickle(pkl_file)
 
     
