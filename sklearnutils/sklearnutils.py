@@ -67,7 +67,9 @@ class GraphsToDataset(torch.utils.data.Dataset):
         graphs, 
         line_graphs,
         ids,
-        labels):
+        labels,
+        classification=False
+        ):
         self.graphs = graphs
         self.line_graphs = line_graphs
         self.ids = ids
@@ -77,6 +79,10 @@ class GraphsToDataset(torch.utils.data.Dataset):
             torch.get_default_dtype()
         )
         
+        if classification:
+            self.labels = self.labels.view(-1).long()
+            print("Classification dataset.", self.labels)
+            
         self.prepare_batch = alignn.graphs.prepare_line_graph_batch
         
     def __len__(self):
@@ -125,7 +131,7 @@ def get_graphs(
         lambda x: Graph.atom_dgl_multigraph(
             x,
             cutoff=config.cutoff,
-            atom_features="atomic_number",
+            atom_features=config.atom_features,
             max_neighbors=config.max_neighbors,
             compute_line_graph=compute_line_graph,
             use_canonize=config.use_canonize,
@@ -178,7 +184,8 @@ def get_loader(
             graphs = X.apply(lambda x: x[0]), 
             line_graphs = X.apply(lambda x: x[1]),
             ids = dataset[config.id_tag],
-            labels = dataset[config.target]
+            labels = dataset[config.target],
+            classification=config.classification_threshold is not None,
             )
     
     else: 
@@ -531,6 +538,7 @@ if __name__ == "__main__":
         df['precomputed_graphs'] = get_graphs(df, config)
         df.to_pickle(pkl_file)
 
+    
     model = AlignnLayerNorm(config)
     df2 = df.sample(frac=0.1,random_state=0)
     X = df2['precomputed_graphs']
