@@ -58,36 +58,61 @@ from jarvis.db.jsonutils import loadjson
 from alignn.graphs import Graph, StructureDataset
 from jarvis.db.figshare import data
 import pathlib
+import dgl 
 
 #%%
-
-def poscars2df(wd: str, target: str = 'target') -> pd.DataFrame:
-    '''
-    convert a folder of POSCARs and id_props.csv into a df with two columns:
-        one called 'atoms' containing dict representations of jarvis.core.atoms.Atoms objects
-        other called 'y' containing labels   
+class GraphsToDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        graphs, 
+        line_graphs,
+        ids,
+        labels):
+        self.graphs = graphs
+        self.line_graphs = line_graphs
+        self.ids = ids
+        self.labels = labels
         
-    The filenames of POSCARs are given as the 1st column in id_props.csv, and 
-    will be used as index of df.
-    '''
-
-    id_tag = 'jid'
-    
-    df = pd.read_csv(wd+'/id_props.csv') 
-    df.columns = [id_tag,target]     
-    df['atoms'] = df[id_tag].apply(
-        lambda x: Atoms.from_poscar(wd+'/'+x).to_dict()
+        self.labels = torch.tensor(self.labels).type(
+            torch.get_default_dtype()
         )
-    df.set_index(id_tag,drop=False)
-    return df 
+        
+        self.prepare_batch = alignn.graphs.prepare_line_graph_batch
+        
+    def __len__(self):
+        """Get length."""
+        return self.labels.shape[0]
+
+    def __getitem__(self, idx):
+        """Get StructureDataset sample."""
+        return self.graphs[idx], self.line_graphs[idx], self.labels[idx]
+
+    @staticmethod
+    def collate_line_graph(
+        samples #: List[Tuple[dgl.DGLGraph, dgl.DGLGraph, torch.Tensor]]
+    ):
+        """Dataloader helper to batch graphs cross `samples`."""
+        graphs, line_graphs, labels = map(list, zip(*samples))
+        batched_graph = dgl.batch(graphs)
+        batched_line_graph = dgl.batch(line_graphs)
+        if len(labels[0].size()) > 0:
+            return batched_graph, batched_line_graph, torch.stack(labels)
+        else:
+            return batched_graph, batched_line_graph, torch.tensor(labels)
+
 
 
 
 #%%
+'''
+need to think
+first need to make sure that 
+'''
 
 def get_graphs(
         df: Union[pd.DataFrame,pd.Series],
         config: TrainingConfig,
+        compute_line_graph=True
         ):
     import swifter
     atoms = df["atoms"].apply(Atoms.from_dict)
@@ -96,29 +121,17 @@ def get_graphs(
     forces swifter to use dask to run parallel apply.
     '''
     # graphs = atoms.progress_apply(
-    graphs = atoms.swifter.force_parallel().apply(
+    df_graphs = atoms.swifter.force_parallel().apply(
         lambda x: Graph.atom_dgl_multigraph(
             x,
             cutoff=config.cutoff,
             atom_features="atomic_number",
             max_neighbors=config.max_neighbors,
-            compute_line_graph=False,
+            compute_line_graph=compute_line_graph,
             use_canonize=config.use_canonize,
         ))
-    return graphs
+    return df_graphs
 
-# def get_graphs(
-#         df: Union[pd.DataFrame,pd.Series],
-#         config: TrainingConfig,
-#         ):
-#     graphs = load_graphs(
-#         df,
-#         neighbor_strategy=config.neighbor_strategy,
-#         use_canonize=config.use_canonize,
-#         cutoff=config.cutoff,
-#         max_neighbors=config.max_neighbors,
-#     )
-#     return graphs
 
 
 def get_loader(
@@ -126,7 +139,6 @@ def get_loader(
         config: TrainingConfig,
         drop_last: bool = True,
         shuffle: bool = True,
-        precomputed_graphs = None
                  ):
 
     dataset = df 
@@ -143,31 +155,40 @@ def get_loader(
     ''' Add a column for id_tag '''
     dataset[config.id_tag] = dataset.index.tolist()
 
+    '''
+    determine the data type of X    
+    '''
+    X = dataset.iloc[:,0]
+    var = X.iloc[0]
+    if isinstance(var,dict):
+        ''' Compute crystal graphs if the data type is atom dict '''
+        graphs = get_graphs(dataset,config,compute_line_graph=False)
+        torch_dataset = StructureDataset(
+            dataset,
+            graphs,
+            target=config.target,
+            atom_features=config.atom_features,
+            line_graph=True,
+            id_tag=config.id_tag,
+            classification=config.classification_threshold is not None,
+        )
+        
+    elif (isinstance(var,tuple) and list(map(type, var)) == [dgl.DGLGraph, dgl.DGLGraph]):
+        torch_dataset = GraphsToDataset(
+            graphs = X.apply(lambda x: x[0]), 
+            line_graphs = X.apply(lambda x: x[1]),
+            ids = dataset[config.id_tag],
+            labels = dataset[config.target]
+            )
     
-    if precomputed_graphs is not None: 
-        graphs = precomputed_graphs
-    else:
-        graphs = get_graphs(dataset,config)
+    else: 
+        raise TypeError(f"Datatype of X not supported (datatype = {type(var)})") 
     
-    torch_dataset = StructureDataset(
-        dataset,
-        graphs,
-        target=config.target,
-        # target_atomwise=target_atomwise,
-        # target_grad=target_grad,
-        # target_stress=target_stress,
-        atom_features=config.atom_features,
-        line_graph=True,
-        id_tag=config.id_tag,
-        classification=config.classification_threshold is not None,
-    )
-    
-    collate_fn = torch_dataset.collate_line_graph    
     loader = DataLoader(
         torch_dataset,
         batch_size=config.batch_size,
         shuffle=shuffle,
-        collate_fn=collate_fn,
+        collate_fn=torch_dataset.collate_line_graph,
         drop_last=drop_last,
         num_workers=config.num_workers,
         pin_memory=config.pin_memory,
@@ -189,7 +210,6 @@ def _fit(
         self, 
         X: Union[pd.DataFrame,pd.Series], 
         y: Union[pd.DataFrame,pd.Series],
-        precomputed_graphs
         ):
     '''
     Parameters
@@ -214,7 +234,6 @@ def _fit(
             config=self.config,
             drop_last = True,
             shuffle = True,
-            precomputed_graphs = precomputed_graphs
             )
     # get trainer
     trainer = _get_trainer(self, train_loader)
@@ -223,8 +242,7 @@ def _fit(
 
 def _predict(
         self,
-        X: Union[pd.DataFrame,pd.Series],
-        precomputed_graphs
+        X: Union[pd.DataFrame,pd.Series]
         ):
     def chunks(lst, n):
         """Yield successive n-sized chunks from lst."""
@@ -236,7 +254,6 @@ def _predict(
             config=self.config,
             drop_last = False,
             shuffle = False,
-            precomputed_graphs = precomputed_graphs
             )        
     col_ids = []
     col_pred = []
@@ -486,15 +503,16 @@ class AlignnLayerNorm(alignn.models.alignn_layernorm.ALIGNN):
         super().__init__(config.model)   
         _init(self, config, chk_file)
 
-    def fit(self, X, y, precomputed_graphs=None):    
-        _fit(self, X, y, precomputed_graphs)
+    def fit(self, X, y):    
+        _fit(self, X, y)
     
-    def predict(self, X, precomputed_graphs=None):
-        y_pred = _predict(self, X, precomputed_graphs)    
+    def predict(self, X):
+        y_pred = _predict(self, X)    
         return y_pred
     
     
 #%%
+
 if __name__ == "__main__":
     
     ''' An example usage of training a model on (10% of) the Jarvis dataset '''
@@ -506,25 +524,23 @@ if __name__ == "__main__":
     pkl_file = 'jarvis.pkl'
     if pathlib.Path.exists(pkl_file):
         df = pd.read_pickle(pkl_file)
-        precomputed_graphs = df['precomputed_graphs']
     else:
         d = data('dft_3d') #choose a name of dataset from above
         df = pd.DataFrame(d).drop_duplicates('jid').set_index('jid')
-        df = df.sample(frac=1,random_state=0)
-        precomputed_graphs = get_graphs(df, config)
-        df['precomputed_graphs'] = precomputed_graphs
-        df.to_pickle()
+        df = df.sample(frac=0.1,random_state=0)
+        df['precomputed_graphs'] = get_graphs(df, config)
+        df.to_pickle(pkl_file)
 
     model = AlignnLayerNorm(config)
-    
-    df2 = df.sample(frac=0.8,random_state=0)
-    X = df2['atoms']
+    df2 = df.sample(frac=0.1,random_state=0)
+    X = df2['precomputed_graphs']
     y = df2['formation_energy_peratom']
-    model.fit(X,y,precomputed_graphs=precomputed_graphs.loc[X.index])
+    # model.fit(X,y,precomputed_graphs=precomputed_graphs.loc[X.index])
+    model.fit(X,y) 
     
     ids = set(df.index.tolist()) - set(df2.index.tolist())
     df1 = df.loc[list(ids)]
-    X = df1['atoms']
+    X = df2['precomputed_graphs']
     y = df1['formation_energy_peratom']
-    y_pred = model.predict(X,precomputed_graphs=precomputed_graphs.loc[X.index])
+    y_pred = model.predict(X)
     y_err = (y_pred - y).abs()
