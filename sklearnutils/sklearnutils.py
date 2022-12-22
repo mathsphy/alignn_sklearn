@@ -131,7 +131,7 @@ def get_graphs(
         lambda x: Graph.atom_dgl_multigraph(
             x,
             cutoff=config.cutoff,
-            atom_features="atomic_number",
+            atom_features=config.atom_features,
             max_neighbors=config.max_neighbors,
             compute_line_graph=compute_line_graph,
             use_canonize=config.use_canonize,
@@ -252,14 +252,14 @@ def _fit(
     None.
 
     '''
-    
+    config=self.config
     # get df
     df = pd.concat([X,y], axis=1)
     
     # get train loader
     train_loader = get_loader(
             df = df,
-            config=self.config,
+            config=config,
             drop_last = True,
             shuffle = True,
             )
@@ -277,9 +277,10 @@ def _predict(
         for i in range(0, len(lst), n):
             yield lst[i:i + n]
     
+    config=self.config
     test_loader = get_loader(
             df = X,
-            config=self.config,
+            config=config,
             drop_last = False,
             shuffle = False,
             )        
@@ -568,3 +569,5 @@ if __name__ == "__main__":
     y = df1['formation_energy_peratom']
     y_pred = model.predict(X)
     y_err = (y_pred - y).abs()
+    
+    
