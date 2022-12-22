@@ -131,14 +131,17 @@ def get_graphs(
         lambda x: Graph.atom_dgl_multigraph(
             x,
             cutoff=config.cutoff,
-            atom_features=config.atom_features,
+            atom_features="atomic_number",
             max_neighbors=config.max_neighbors,
             compute_line_graph=compute_line_graph,
             use_canonize=config.use_canonize,
         ))
     return df_graphs
 
-
+def graph_to_line_graph(g):
+    lg = g.line_graph(shared=True)
+    lg.apply_edges(compute_bond_cosines)
+    return lg
 
 def get_loader(
         df: Union[pd.DataFrame,pd.Series],
@@ -180,11 +183,10 @@ def get_loader(
         )
         
     elif isinstance(var,dgl.DGLGraph):
-        ''' crystal graph ''' 
+        ''' var is crystal graph ''' 
         graphs = X 
-        line_graphs = X.apply(
-            lambda g: g.line_graph(shared=True).apply_edges(compute_bond_cosines)
-            )
+        print('Computing line graphs')
+        line_graphs = graphs.progress_apply(graph_to_line_graph)
         
         torch_dataset = GraphsToDataset(
             graphs = graphs,
@@ -195,6 +197,7 @@ def get_loader(
             )
         
     elif (isinstance(var,tuple) and list(map(type, var)) == [dgl.DGLGraph, dgl.DGLGraph]):
+        ''' var = (crystal graph, line graph) ''' 
         graphs = X.apply(lambda x: x[0])
         line_graphs = X.apply(lambda x: x[1])
         
@@ -540,21 +543,16 @@ class AlignnLayerNorm(alignn.models.alignn_layernorm.ALIGNN):
 
 if __name__ == "__main__":
     
-    ''' An example usage of training a model on (10% of) the Jarvis dataset '''
+    ''' An example usage of training a model on (1% of) the Jarvis dataset '''
     config_filename = 'config.json'
     config = loadjson(config_filename)
     config = TrainingConfig(**config)
     config.target = 'formation_energy_peratom'
 
-    pkl_file = 'jarvis.pkl'
-    try:
-        df = pd.read_pickle(pkl_file)
-    except:
-        d = data('dft_3d') #choose a name of dataset from above
-        df = pd.DataFrame(d).drop_duplicates('jid').set_index('jid')
-        df = df.sample(frac=0.1,random_state=0)
-        df['precomputed_graphs'] = get_graphs(df, config,compute_line_graph=True)
-        df.to_pickle(pkl_file)
+    d = data('dft_3d') #choose a name of dataset from above
+    df = pd.DataFrame(d).drop_duplicates('jid').set_index('jid')
+    df = df.sample(frac=0.01,random_state=0)
+    df['precomputed_graphs'] = get_graphs(df, config,compute_line_graph=True)
 
     
     model = AlignnLayerNorm(config)
@@ -563,7 +561,7 @@ if __name__ == "__main__":
     y = df2['formation_energy_peratom']
     # model.fit(X,y,precomputed_graphs=precomputed_graphs.loc[X.index])
     model.fit(X,y) 
-    
+
     ids = set(df.index.tolist()) - set(df2.index.tolist())
     df1 = df.loc[list(ids)]
     X = df2['precomputed_graphs']
