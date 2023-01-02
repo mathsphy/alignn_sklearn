@@ -6,7 +6,7 @@ Create a sklearn interface
 
 """
 
-from typing import Any, Dict, Union
+from typing import Union
 from torch import nn
 import pandas as pd
 import os
@@ -33,7 +33,6 @@ from ignite.metrics import (
     ConfusionMatrix,
 )
 
-from alignn.data import get_torch_dataset, load_graphs
 from torch.utils.data import DataLoader
     
 from alignn.train import (
@@ -59,6 +58,7 @@ from alignn.graphs import Graph, StructureDataset,compute_bond_cosines
 from jarvis.db.figshare import data
 import pathlib
 import dgl 
+import torch.distributed as dist
 
 #%%
 class GraphsToDataset(torch.utils.data.Dataset):
@@ -171,7 +171,7 @@ def get_loader(
     var = X.iloc[0]
     if isinstance(var,dict):
         ''' Compute crystal graphs if the data type is atom dict '''
-        graphs = get_graphs(dataset,config,compute_line_graph=False)
+        graphs = get_graphs(dataset,config,compute_line_graph=False).to_numpy()
         torch_dataset = StructureDataset(
             dataset,
             graphs,
@@ -184,28 +184,33 @@ def get_loader(
         
     elif isinstance(var,dgl.DGLGraph):
         ''' var is crystal graph ''' 
-        graphs = X 
+        graphs = X.to_numpy()
         print('Computing line graphs')
-        line_graphs = graphs.progress_apply(graph_to_line_graph)
+        line_graphs = X.progress_apply(graph_to_line_graph).to_numpy()
+        labels = dataset[config.target].to_numpy()
+        ids = dataset[config.id_tag].to_numpy()
         
         torch_dataset = GraphsToDataset(
             graphs = graphs,
             line_graphs = line_graphs,
-            ids = dataset[config.id_tag],
-            labels = dataset[config.target],
+            ids = ids,
+            labels = labels,
             classification=config.classification_threshold is not None,
             )
         
     elif (isinstance(var,tuple) and list(map(type, var)) == [dgl.DGLGraph, dgl.DGLGraph]):
         ''' var = (crystal graph, line graph) ''' 
-        graphs = X.apply(lambda x: x[0])
-        line_graphs = X.apply(lambda x: x[1])
+        
+        graphs = X.apply(lambda x: x[0]).to_numpy()
+        line_graphs = X.apply(lambda x: x[1]).to_numpy()
+        labels = dataset[config.target].to_numpy()
+        ids = dataset[config.id_tag].to_numpy()
         
         torch_dataset = GraphsToDataset(
             graphs = graphs,
             line_graphs = line_graphs,
-            ids = dataset[config.id_tag],
-            labels = dataset[config.target],
+            ids = ids,
+            labels = labels,
             classification=config.classification_threshold is not None,
             )
     
@@ -223,9 +228,10 @@ def get_loader(
     )  
     return loader
 
-def _init(self, config: TrainingConfig, chk_file):         
+def _init(self, config: TrainingConfig, chk_file, reset_parameters):         
     self.config = config        
     self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    self.reset_parameters = reset_parameters
     # load the checkpoint file
     if chk_file is not None:       
         self.load_state_dict(
@@ -233,7 +239,10 @@ def _init(self, config: TrainingConfig, chk_file):
             )
         print(f'Checkpoint file {chk_file} loaded')
     self.to(self.device)
-    
+
+    pathlib.Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
+    torch.save(self.state_dict(), self.config.output_dir+'/model_initial.pth')
+
 def _fit(
         self, 
         X: Union[pd.DataFrame,pd.Series], 
@@ -252,6 +261,16 @@ def _fit(
     None.
 
     '''
+    
+    
+    ''' reset parameters every time '''
+    if self.reset_parameters:
+        self.load_state_dict(torch.load(self.config.output_dir+'/model_initial.pth'))
+        # for layer in self.children():
+        #     if hasattr(layer, 'reset_parameters'):
+        #         layer.reset_parameters()
+        #         print(layer)
+    
     config=self.config
     # get df
     df = pd.concat([X,y], axis=1)
@@ -277,6 +296,8 @@ def _predict(
         for i in range(0, len(lst), n):
             yield lst[i:i + n]
     
+    self.eval()
+    
     config=self.config
     test_loader = get_loader(
             df = X,
@@ -296,7 +317,10 @@ def _predict(
             out_data = self([g.to(self.device), lg.to(self.device)])
             out_data = out_data.cpu().numpy().tolist()
             col_ids.extend(ids)
-            col_pred.extend(out_data)
+            if isinstance(out_data,list): # list of values
+                col_pred.extend(out_data)
+            else: # single value
+                col_pred.append(out_data)
     results = pd.Series(data=col_pred,index=col_ids,name=config.target)
     return results
     
@@ -335,6 +359,22 @@ def _get_trainer(self, train_loader):
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer,
         )
+        
+    if config.distributed:
+        def setup(rank, world_size):
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = "12355"
+            # initialize the process group
+            dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+        def cleanup():
+            dist.destroy_process_group()
+
+        setup(2, 2)
+        # local_rank = 0
+        # net=torch.nn.parallel.DataParallel(net
+        # ,device_ids=[local_rank, ],output_device=local_rank)
+        self = torch.nn.parallel.DistributedDataParallel(self)     
         
     '''
     select configured loss function
@@ -514,9 +554,9 @@ def _get_trainer(self, train_loader):
    
 class AlignnBatchNorm(alignn.models.alignn.ALIGNN):
 
-    def __init__(self, config: TrainingConfig, chk_file=None):        
+    def __init__(self, config: TrainingConfig, chk_file=None, reset_parameters=True):        
         super().__init__(config.model)   
-        _init(self, config, chk_file)
+        _init(self, config, chk_file, reset_parameters)
 
     def fit(self, X, y, precomputed_graphs=None):    
         _fit(self, X, y, precomputed_graphs)
@@ -528,9 +568,9 @@ class AlignnBatchNorm(alignn.models.alignn.ALIGNN):
 
 class AlignnLayerNorm(alignn.models.alignn_layernorm.ALIGNN):
 
-    def __init__(self, config: TrainingConfig, chk_file=None):        
+    def __init__(self, config: TrainingConfig, chk_file=None, reset_parameters=True):        
         super().__init__(config.model)   
-        _init(self, config, chk_file)
+        _init(self, config, chk_file, reset_parameters)
 
     def fit(self, X, y):    
         _fit(self, X, y)
