@@ -107,14 +107,6 @@ class GraphsToDataset(torch.utils.data.Dataset):
             return batched_graph, batched_line_graph, torch.tensor(labels)
 
 
-
-
-#%%
-'''
-need to think
-first need to make sure that 
-'''
-
 def get_graphs(
         df: Union[pd.DataFrame,pd.Series],
         config: TrainingConfig,
@@ -138,7 +130,9 @@ def get_graphs(
         ))
     return df_graphs
 
+
 def graph_to_line_graph(g):
+    ''' crystal graph to line graph '''
     lg = g.line_graph(shared=True)
     lg.apply_edges(compute_bond_cosines)
     return lg
@@ -228,7 +222,20 @@ def get_loader(
     )  
     return loader
 
-def _init(self, config: TrainingConfig, chk_file, reset_parameters):         
+
+def _init(self, config: TrainingConfig, chk_file, reset_parameters):   
+    '''
+    initialize an ALIGNN instance
+    
+    chk_file: initialize the instance as a pretrained model.
+
+    reset_parameters: whether reset model parameters for every fit. If True, 
+    the model will be trained from scratch every time when ``fit" method is 
+    called. If False, the `fit" method will train the model based on the model 
+    parameters obtained from the previous `fit".     
+
+    '''
+      
     self.config = config        
     self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # if load the checkpoint file
@@ -244,6 +251,7 @@ def _init(self, config: TrainingConfig, chk_file, reset_parameters):
 
     self.to(self.device)
     pathlib.Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)  
+
 
 def _fit(
         self, 
@@ -285,10 +293,7 @@ def _fit(
     trainer.run(train_loader, max_epochs=config.epochs)
 
 
-def _predict(
-        self,
-        X: Union[pd.DataFrame,pd.Series]
-        ):
+def _predict(self, X: Union[pd.DataFrame,pd.Series]):
     def chunks(lst, n):
         """Yield successive n-sized chunks from lst."""
         for i in range(0, len(lst), n):
@@ -523,7 +528,6 @@ def _get_trainer(self, train_loader):
     def log_results(engine):
         """Print training and validation metrics to console."""
         train_evaluator.run(train_loader)
-
         tmetrics = train_evaluator.state.metrics
         for metric in metrics.keys():
             tm = tmetrics[metric]
@@ -548,10 +552,9 @@ def _get_trainer(self, train_loader):
                 pbar.log_message(f"Train ROC AUC: {tmetrics['rocauc']:.4f}")
     return trainer
 
-#%%
    
 class AlignnBatchNorm(alignn.models.alignn.ALIGNN):
-
+    ''' Alignn class with BatchNorm '''
     def __init__(self, config: TrainingConfig, chk_file=None, reset_parameters=True):        
         super().__init__(config.model)   
         _init(self, config, chk_file, reset_parameters)
@@ -565,7 +568,7 @@ class AlignnBatchNorm(alignn.models.alignn.ALIGNN):
 
 
 class AlignnLayerNorm(alignn.models.alignn_layernorm.ALIGNN):
-
+    ''' Alignn class with LayerNorm '''
     def __init__(self, config: TrainingConfig, chk_file=None, reset_parameters=True):        
         super().__init__(config.model)   
         _init(self, config, chk_file, reset_parameters)
