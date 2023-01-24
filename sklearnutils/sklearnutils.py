@@ -231,17 +231,19 @@ def get_loader(
 def _init(self, config: TrainingConfig, chk_file, reset_parameters):         
     self.config = config        
     self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    self.reset_parameters = reset_parameters
-    # load the checkpoint file
+    # if load the checkpoint file
     if chk_file is not None:       
         self.load_state_dict(
             torch.load(chk_file, map_location=self.device)["model"]
             )
         print(f'Checkpoint file {chk_file} loaded')
-    self.to(self.device)
+        self.reset_parameters = False        
+    else:
+        self.reset_parameters = reset_parameters
+        torch.save(self.state_dict(), self.config.output_dir+'/model_initial.pth')
 
-    pathlib.Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
-    torch.save(self.state_dict(), self.config.output_dir+'/model_initial.pth')
+    self.to(self.device)
+    pathlib.Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)  
 
 def _fit(
         self, 
@@ -266,10 +268,6 @@ def _fit(
     ''' reset parameters every time '''
     if self.reset_parameters:
         self.load_state_dict(torch.load(self.config.output_dir+'/model_initial.pth'))
-        # for layer in self.children():
-        #     if hasattr(layer, 'reset_parameters'):
-        #         layer.reset_parameters()
-        #         print(layer)
     
     config=self.config
     # get df
