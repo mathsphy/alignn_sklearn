@@ -112,22 +112,24 @@ def get_graphs(
         config: TrainingConfig,
         compute_line_graph=True
         ):
-    import swifter
-    atoms = df["atoms"].apply(Atoms.from_dict)
+    if isinstance(df, pd.Series) or (
+            isinstance(df, pd.DataFrame) and df.shape[1] == 1
+            ):        
+        atoms = df.progress_apply(Atoms.from_dict)
+    else:
+        atoms = df["atoms"].progress_apply(Atoms.from_dict)
+    
     print('Converting atoms object to crystal graphs')
-    ''' 
-    forces swifter to use dask to run parallel apply.
-    '''
-    # graphs = atoms.progress_apply(
-    df_graphs = atoms.swifter.force_parallel().apply(
-        lambda x: Graph.atom_dgl_multigraph(
-            x,
-            cutoff=config.cutoff,
-            atom_features=config.atom_features,
-            max_neighbors=config.max_neighbors,
-            compute_line_graph=compute_line_graph,
-            use_canonize=config.use_canonize,
-        ))
+
+    df_graphs = atoms.progress_apply(
+            lambda x: Graph.atom_dgl_multigraph(
+                x,
+                cutoff=config.cutoff,
+                atom_features=config.atom_features,
+                max_neighbors=config.max_neighbors,
+                compute_line_graph=compute_line_graph,
+                use_canonize=config.use_canonize,
+            ))
     return df_graphs
 
 
@@ -151,10 +153,10 @@ def get_loader(
     '''
     if isinstance(dataset, pd.Series):
         dataset = dataset.to_frame()
+
+    if isinstance(dataset, pd.DataFrame) and dataset.shape[1] == 1:
         dataset[config.target] = -9999 # place holder for the predict method
-    elif isinstance(dataset, pd.DataFrame):
-        if dataset.shape[1] == 1:
-            dataset[config.target] = -9999 # place holder for the predict method
+        
     ''' Add a column for id_tag '''
     dataset[config.id_tag] = dataset.index.tolist()
 
@@ -166,50 +168,62 @@ def get_loader(
     if isinstance(var,dict):
         ''' Compute crystal graphs if the data type is atom dict '''
         graphs = get_graphs(dataset,config,compute_line_graph=False).to_numpy()
-        torch_dataset = StructureDataset(
-            dataset,
-            graphs,
-            target=config.target,
-            atom_features=config.atom_features,
-            line_graph=True,
-            id_tag=config.id_tag,
-            classification=config.classification_threshold is not None,
-        )
+        # torch_dataset = StructureDataset(
+        #     dataset,
+        #     graphs,
+        #     target=config.target,
+        #     atom_features=config.atom_features,
+        #     line_graph=True,
+        #     id_tag=config.id_tag,
+        #     classification=config.classification_threshold is not None,
+        # )
+        line_graphs = pd.DataFrame(graphs).progress_apply(graph_to_line_graph).to_numpy()
         
     elif isinstance(var,dgl.DGLGraph):
         ''' var is crystal graph ''' 
         graphs = X.to_numpy()
         print('Computing line graphs')
         line_graphs = X.progress_apply(graph_to_line_graph).to_numpy()
-        labels = dataset[config.target].to_numpy()
-        ids = dataset[config.id_tag].to_numpy()
+        # labels = dataset[config.target].to_numpy()
+        # ids = dataset[config.id_tag].to_numpy()
         
-        torch_dataset = GraphsToDataset(
-            graphs = graphs,
-            line_graphs = line_graphs,
-            ids = ids,
-            labels = labels,
-            classification=config.classification_threshold is not None,
-            )
-        
+        # torch_dataset = GraphsToDataset(
+        #     graphs = graphs,
+        #     line_graphs = line_graphs,
+        #     ids = ids,
+        #     labels = labels,
+        #     classification=config.classification_threshold is not None,
+        #     )
+
     elif (isinstance(var,tuple) and list(map(type, var)) == [dgl.DGLGraph, dgl.DGLGraph]):
         ''' var = (crystal graph, line graph) ''' 
         
         graphs = X.apply(lambda x: x[0]).to_numpy()
         line_graphs = X.apply(lambda x: x[1]).to_numpy()
-        labels = dataset[config.target].to_numpy()
-        ids = dataset[config.id_tag].to_numpy()
+        # labels = dataset[config.target].to_numpy()
+        # ids = dataset[config.id_tag].to_numpy()
         
-        torch_dataset = GraphsToDataset(
-            graphs = graphs,
-            line_graphs = line_graphs,
-            ids = ids,
-            labels = labels,
-            classification=config.classification_threshold is not None,
-            )
+        # torch_dataset = GraphsToDataset(
+        #     graphs = graphs,
+        #     line_graphs = line_graphs,
+        #     ids = ids,
+        #     labels = labels,
+        #     classification=config.classification_threshold is not None,
+        #     )
     
     else: 
         raise TypeError(f"Datatype of X not supported (datatype = {type(var)})") 
+    
+    labels = dataset[config.target].to_numpy()
+    ids = dataset[config.id_tag].to_numpy()    
+    torch_dataset = GraphsToDataset(
+        graphs = graphs,
+        line_graphs = line_graphs,
+        ids = ids,
+        labels = labels,
+        classification=config.classification_threshold is not None,
+        )    
+    
     
     loader = DataLoader(
         torch_dataset,
@@ -238,6 +252,8 @@ def _init(self, config: TrainingConfig, chk_file, reset_parameters):
       
     self.config = config        
     self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pathlib.Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)  
+
     # if load the checkpoint file
     if chk_file is not None:       
         self.load_state_dict(
@@ -250,13 +266,14 @@ def _init(self, config: TrainingConfig, chk_file, reset_parameters):
         torch.save(self.state_dict(), self.config.output_dir+'/model_initial.pth')
 
     self.to(self.device)
-    pathlib.Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)  
 
 
 def _fit(
         self, 
         X: Union[pd.DataFrame,pd.Series], 
         y: Union[pd.DataFrame,pd.Series],
+        val: tuple = None,
+        test: tuple=None,
         ):
     '''
     Parameters
@@ -280,6 +297,11 @@ def _fit(
     config=self.config
     # get df
     df = pd.concat([X,y], axis=1)
+    # rename columns, so that the target column is named as config.target
+    if isinstance(X, pd.Series):
+        df.columns = [X.name,config.target]
+    elif isinstance(X, pd.DataFrame):
+        df.columns = [X.columns,config.target]
     
     # get train loader
     train_loader = get_loader(
@@ -288,8 +310,29 @@ def _fit(
             drop_last = True,
             shuffle = True,
             )
+    
+    if val is not None:
+        val_loader = get_loader(
+                df = pd.concat(val, axis=1),
+                config=config,
+                drop_last = False,
+                shuffle = False,
+                )
+    else:
+        val_loader = None
+
+    if test is not None:
+        test_loader = get_loader(
+                df = pd.concat(test, axis=1),
+                config=config,
+                drop_last = False,
+                shuffle = False,
+                )
+    else:
+        test_loader = None
+
     # get trainer
-    trainer = _get_trainer(self, train_loader)
+    trainer = _get_trainer(self, train_loader, val_loader=val_loader,test_loader=test_loader)
     trainer.run(train_loader, max_epochs=config.epochs)
 
 
@@ -328,7 +371,7 @@ def _predict(self, X: Union[pd.DataFrame,pd.Series]):
     return results
     
 
-def _get_trainer(self, train_loader):
+def _get_trainer(self, train_loader, val_loader,test_loader):
 
     config = self.config
     
@@ -336,6 +379,11 @@ def _get_trainer(self, train_loader):
     set up scheduler 
     ''' 
     
+    if val_loader is None:
+        val_loader = train_loader
+    if test_loader is None:
+        test_loader = train_loader
+
     # group parameters to skip weight decay for bias and batchnorm
     params = group_decay(self)
     optimizer = setup_optimizer(params, config)
@@ -504,39 +552,70 @@ def _get_trainer(self, train_loader):
     '''
     log performance
     '''
-    
+    # create evaluator for train, val and test 
     train_evaluator = create_supervised_evaluator(
         self,
         metrics=metrics,
         prepare_batch=prepare_batch,
         device=self.device,
-        # output_transform=make_standard_scalar_and_pca,
     )
 
+    val_evaluator = create_supervised_evaluator(
+        self,
+        metrics=metrics,
+        prepare_batch=prepare_batch,
+        device=self.device,
+    )
+
+    test_evaluator = create_supervised_evaluator(
+        self,
+        metrics=metrics,
+        prepare_batch=prepare_batch,
+        device=self.device,
+    )
+    
     history = {
         "train": {m: [] for m in metrics.keys()},
-        # "validation": {m: [] for m in metrics.keys()},
+        "val": {m: [] for m in metrics.keys()},
+        "test": {m: [] for m in metrics.keys()},
     }
 
     if config.store_outputs:
-        # log_results handler will save epoch output
-        # in history["EOS"]
+        # log_results handler will save epoch output in history["EOS"]
         train_eos = EpochOutputStore()
         train_eos.attach(train_evaluator)
+        val_eos = EpochOutputStore()
+        val_eos.attach(val_evaluator)
+        test_eos = EpochOutputStore()
+        test_eos.attach(test_evaluator)
+
+
     # collect evaluation performance
     @trainer.on(Events.EPOCH_COMPLETED)
     def log_results(engine):
         """Print training and validation metrics to console."""
         train_evaluator.run(train_loader)
+        val_evaluator.run(val_loader)
+        test_evaluator.run(test_loader)
+
         tmetrics = train_evaluator.state.metrics
+        vmetrics = val_evaluator.state.metrics
+        testmetrics = test_evaluator.state.metrics
         for metric in metrics.keys():
             tm = tmetrics[metric]
+            vm = vmetrics[metric]
+            testm = testmetrics[metric]
             if metric == "roccurve":
                 tm = [k.tolist() for k in tm]
+                vm = [k.tolist() for k in vm]
+                testm = [k.tolist() for k in testm]
             if isinstance(tm, torch.Tensor):
                 tm = tm.cpu().numpy().tolist()
-
+                vm = vm.cpu().numpy().tolist()
+                testm = testm.cpu().numpy().tolist()
             history["train"][metric].append(tm)
+            history["val"][metric].append(vm)
+            history["test"][metric].append(testm)
 
         if config.store_outputs:
             history["trainEOS"] = train_eos.data
@@ -544,12 +623,27 @@ def _get_trainer(self, train_loader):
                 filename=os.path.join(config.output_dir, "history_train.json"),
                 data=history["train"],
             )
+            history["valEOS"] = val_eos.data
+            dumpjson(
+                filename=os.path.join(config.output_dir, "history_val.json"),
+                data=history["val"],
+            )
+            history["testEOS"] = test_eos.data
+            dumpjson(
+                filename=os.path.join(config.output_dir, "history_test.json"),
+                data=history["test"],
+            )
+
         if config.progress:
             pbar = ProgressBar()
             if config.classification_threshold is None:
                 pbar.log_message(f"Train_MAE: {tmetrics['mae']:.4f}, Train_RMSE: {tmetrics['rmse']:.4f}")
+                pbar.log_message(f"Val_MAE: {vmetrics['mae']:.4f}, Val_RMSE: {vmetrics['rmse']:.4f}")
+                pbar.log_message(f"Test_MAE: {testmetrics['mae']:.4f}, Test_RMSE: {testmetrics['rmse']:.4f}")
             else:
                 pbar.log_message(f"Train ROC AUC: {tmetrics['rocauc']:.4f}")
+                pbar.log_message(f"Val ROC AUC: {vmetrics['rocauc']:.4f}")
+                pbar.log_message(f"Test ROC AUC: {testmetrics['rocauc']:.4f}")
     return trainer
 
    
@@ -559,11 +653,11 @@ class AlignnBatchNorm(alignn.models.alignn.ALIGNN):
         super().__init__(config.model)   
         _init(self, config, chk_file, reset_parameters)
 
-    def fit(self, X, y, precomputed_graphs=None):    
-        _fit(self, X, y, precomputed_graphs)
+    def fit(self, X, y, val=None,test=None):    
+        _fit(self, X, y, val=val,test=test)
     
-    def predict(self, X, precomputed_graphs=None):
-        y_pred = _predict(self, X, precomputed_graphs)    
+    def predict(self, X):
+        y_pred = _predict(self, X)    
         return y_pred
 
 
@@ -573,8 +667,8 @@ class AlignnLayerNorm(alignn.models.alignn_layernorm.ALIGNN):
         super().__init__(config.model)   
         _init(self, config, chk_file, reset_parameters)
 
-    def fit(self, X, y):    
-        _fit(self, X, y)
+    def fit(self, X, y, val=None,test=None):    
+        _fit(self, X, y, val=val,test=test)
     
     def predict(self, X):
         y_pred = _predict(self, X)    
@@ -610,5 +704,6 @@ if __name__ == "__main__":
     y = df1['formation_energy_peratom']
     y_pred = model.predict(X)
     y_err = (y_pred - y).abs()
+    
     
     
